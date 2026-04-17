@@ -366,7 +366,7 @@ async def get_installer(token: str, request_host: Optional[str] = Header(None, a
     if token not in users:
         raise HTTPException(status_code=404, detail="Token not found")
     host = request_host or "personal-agent-q29j.onrender.com"
-    script = INSTALLER_TEMPLATE.format(host=host, token=token)
+    script = INSTALLER_TEMPLATE.replace("{host}", host).replace("{token}", token)
     return PlainTextResponse(content=script, media_type="text/plain; charset=utf-8")
 
 
