@@ -8,7 +8,7 @@ import anthropic
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel
 
 app = FastAPI(title="Personal AI Agent")
@@ -21,40 +21,62 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---- State ----
-bridge_ws: Optional[WebSocket] = None
-pending_tool_calls: dict[str, asyncio.Future] = {}
+# ---- Multi-user state ----
+# Each user token maps to their own bridge WebSocket and pending calls
+bridges: dict[str, WebSocket] = {}
+pending: dict[str, dict[str, asyncio.Future]] = {}
 
-AGENT_TOKEN = os.environ.get("AGENT_TOKEN", "change-me-secret")
+# Admin token — only used to create new user tokens
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "admin-change-me")
+
+# User tokens stored in memory: {token: {"name": str}}
+# Pre-populate from env: USERS="gil:gil1988,ima:ima2024"
+users: dict[str, dict] = {}
+
+def load_users_from_env():
+    raw = os.environ.get("USERS", "")
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if ":" in pair:
+            name, token = pair.split(":", 1)
+            users[token.strip()] = {"name": name.strip()}
+
+load_users_from_env()
+
+def get_user(authorization: Optional[str]) -> dict:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    token = authorization.replace("Bearer ", "").strip()
+    if token not in users:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return {"token": token, **users[token]}
+
 
 TOOLS = [
     {
         "name": "execute_command",
-        "description": (
-            "Execute a terminal/shell command on Gil's local Windows machine. "
-            "Use PowerShell syntax. Returns stdout + stderr."
-        ),
+        "description": "Execute a terminal/shell command on the user's local Windows machine. Use PowerShell syntax.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "command": {"type": "string", "description": "Command to run"},
-                "working_dir": {"type": "string", "description": "Working directory (optional)"},
+                "command": {"type": "string"},
+                "working_dir": {"type": "string"},
             },
             "required": ["command"],
         },
     },
     {
         "name": "read_file",
-        "description": "Read the full contents of a file on Gil's local machine.",
+        "description": "Read the full contents of a file on the user's local machine.",
         "input_schema": {
             "type": "object",
-            "properties": {"path": {"type": "string", "description": "Absolute file path"}},
+            "properties": {"path": {"type": "string"}},
             "required": ["path"],
         },
     },
     {
         "name": "write_file",
-        "description": "Write (or overwrite) a file on Gil's local machine.",
+        "description": "Write (or overwrite) a file on the user's local machine.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -66,7 +88,7 @@ TOOLS = [
     },
     {
         "name": "list_directory",
-        "description": "List contents of a directory on Gil's local machine.",
+        "description": "List contents of a directory on the user's local machine.",
         "input_schema": {
             "type": "object",
             "properties": {"path": {"type": "string"}},
@@ -75,7 +97,7 @@ TOOLS = [
     },
     {
         "name": "open_browser",
-        "description": "Open a URL in the default browser on Gil's local machine.",
+        "description": "Open a URL in the default browser on the user's local machine.",
         "input_schema": {
             "type": "object",
             "properties": {"url": {"type": "string"}},
@@ -84,99 +106,82 @@ TOOLS = [
     },
     {
         "name": "search_files",
-        "description": (
-            "Search for files by glob pattern and/or text content on Gil's local machine. "
-            "Returns matching file paths."
-        ),
+        "description": "Search for files by glob pattern and/or text content on the user's local machine.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "directory": {"type": "string", "description": "Root directory to search"},
-                "pattern": {"type": "string", "description": "Glob pattern, e.g. '*.py' or '**/*.md'"},
-                "content_search": {"type": "string", "description": "Return only files containing this text"},
+                "directory": {"type": "string"},
+                "pattern": {"type": "string"},
+                "content_search": {"type": "string"},
             },
             "required": ["directory"],
         },
     },
     {
         "name": "read_md_files",
-        "description": (
-            "Read all .md (Markdown) files from a directory recursively. "
-            "Use this to quickly load context about a project."
-        ),
+        "description": "Read all .md files from a directory recursively for context.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "directory": {"type": "string"},
-                "max_files": {"type": "integer", "description": "Max files to read (default 15)"},
+                "max_files": {"type": "integer"},
             },
             "required": ["directory"],
         },
     },
     {
         "name": "open_claude_code",
-        "description": (
-            "Open Claude Code CLI in a new terminal window on Gil's machine, "
-            "optionally with an initial prompt. Use this to delegate complex coding tasks."
-        ),
+        "description": "Open Claude Code CLI in a new terminal window, optionally with a prompt.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "working_dir": {"type": "string", "description": "Project directory to open"},
-                "prompt": {"type": "string", "description": "Initial prompt to pass to Claude Code"},
+                "working_dir": {"type": "string"},
+                "prompt": {"type": "string"},
             },
             "required": ["working_dir"],
         },
     },
 ]
 
-SYSTEM_PROMPT = """You are Gil's personal AI assistant — always available, always helpful.
+SYSTEM_PROMPT = """You are {name}'s personal AI assistant with full access to their computer.
 
-Gil is a developer working on multiple projects:
-- Social AI Platform (social media automation)
-- WhatsApp AI bot
-- Various side projects in C:\\Users\\Gilge\\
-
-When the local bridge IS connected, you have full computer access:
+When the local bridge IS connected you can:
 - Execute shell commands (Windows/PowerShell)
 - Read and write files
-- Search through codebases
-- Open browsers to specific URLs
-- Read project .md files for context
-- Launch Claude Code for complex coding tasks
+- Search through files and folders
+- Open URLs in the browser
+- Read .md files for project context
+- Open Claude Code for coding tasks
 
-When the local bridge is NOT connected (computer is off or bridge not running):
-- Work as a regular AI assistant — answer questions, help with code, write content, analyze, plan
-- Do NOT repeatedly complain about the bridge being disconnected
-- Just help with whatever Gil needs using your knowledge
+When the bridge is NOT connected:
+- Work as a regular helpful AI assistant
+- Answer questions, help with tasks, explain things
+- Never say "I can't help" — always find a way to assist
 
-How to work:
-1. When asked about a project and bridge is connected, first read its .md files for context
-2. For file operations, use absolute Windows paths
-3. Be direct — take action, then report what you did
-4. If a tool fails due to bridge disconnection, continue helping in whatever way you can without the tool
-5. Never say "I can't help" — always find a way to assist
-
-Gil communicates in Hebrew and English. Always respond in the same language he used."""
+Rules:
+1. Be direct — take action, then report what you did
+2. Use absolute Windows paths for file operations
+3. If a tool fails, continue helping without it
+4. Respond in the same language the user writes in (Hebrew or English)"""
 
 
-async def dispatch(tool_name: str, tool_input: dict) -> str:
-    if bridge_ws is None:
-        return "⚠️ Local bridge not connected. Start bridge.py on your machine."
+async def dispatch(token: str, tool_name: str, tool_input: dict) -> str:
+    ws = bridges.get(token)
+    if ws is None:
+        return "⚠️ המחשב שלך לא מחובר. הפעל את bridge.py."
 
     call_id = str(uuid.uuid4())
     loop = asyncio.get_event_loop()
     future: asyncio.Future = loop.create_future()
-    pending_tool_calls[call_id] = future
+    pending.setdefault(token, {})[call_id] = future
 
-    await bridge_ws.send_json({"id": call_id, "tool": tool_name, "input": tool_input})
+    await ws.send_json({"id": call_id, "tool": tool_name, "input": tool_input})
 
     try:
-        result = await asyncio.wait_for(future, timeout=90.0)
-        return result
+        return await asyncio.wait_for(future, timeout=90.0)
     except asyncio.TimeoutError:
-        pending_tool_calls.pop(call_id, None)
-        return "⚠️ Tool execution timed out after 90s"
+        pending.get(token, {}).pop(call_id, None)
+        return "⚠️ הפעולה פגה את הזמן (90 שניות)"
 
 
 # ---- API ----
@@ -186,16 +191,14 @@ class ChatRequest(BaseModel):
     history: list = []
 
 
-def verify_token(authorization: Optional[str] = Header(None)):
-    if not authorization or authorization != f"Bearer {AGENT_TOKEN}":
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-
 @app.post("/chat")
 async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)):
-    verify_token(authorization)
+    user = get_user(authorization)
+    token = user["token"]
+    name = user["name"]
 
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    system = SYSTEM_PROMPT.format(name=name)
 
     messages = list(request.history) + [{"role": "user", "content": request.message}]
     response_text = ""
@@ -205,7 +208,7 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
         response = client.messages.create(
             model="claude-opus-4-6",
             max_tokens=8096,
-            system=SYSTEM_PROMPT,
+            system=system,
             tools=TOOLS,
             messages=messages,
         )
@@ -218,13 +221,12 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
             for block in response.content:
                 if block.type == "tool_use":
                     tool_log.append({"tool": block.name, "input": block.input})
-                    result = await dispatch(block.name, block.input)
+                    result = await dispatch(token, block.name, block.input)
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
                         "content": result,
                     })
-
             messages.append({"role": "user", "content": tool_results})
 
         elif response.stop_reason == "end_turn":
@@ -236,30 +238,26 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(None)
         else:
             break
 
-    return {
-        "response": response_text,
-        "history": messages,
-        "tools_used": tool_log,
-    }
+    return {"response": response_text, "history": messages, "tools_used": tool_log}
 
 
 @app.get("/bridge-status")
-async def bridge_status():
-    return {"connected": bridge_ws is not None}
+async def bridge_status(authorization: Optional[str] = Header(None)):
+    user = get_user(authorization)
+    return {"connected": user["token"] in bridges}
 
 
 @app.websocket("/ws/bridge")
 async def bridge_endpoint(websocket: WebSocket):
-    global bridge_ws
-
     token = websocket.query_params.get("token", "")
-    if token != AGENT_TOKEN:
+    if token not in users:
         await websocket.close(code=4001)
         return
 
     await websocket.accept()
-    bridge_ws = websocket
-    print("✅ Local bridge connected")
+    bridges[token] = websocket
+    name = users[token]["name"]
+    print(f"✅ Bridge connected: {name}")
 
     try:
         while True:
@@ -267,17 +265,113 @@ async def bridge_endpoint(websocket: WebSocket):
             call_id = data.get("id")
             result = data.get("result", "")
 
-            future = pending_tool_calls.pop(call_id, None)
+            future = pending.get(token, {}).pop(call_id, None)
             if future and not future.done():
                 future.set_result(result)
     except WebSocketDisconnect:
-        bridge_ws = None
-        print("❌ Local bridge disconnected")
+        bridges.pop(token, None)
+        print(f"❌ Bridge disconnected: {name}")
+
+
+# ---- Admin: create new user ----
+class NewUserRequest(BaseModel):
+    name: str
+    token: str
+
+@app.post("/admin/add-user")
+async def add_user(req: NewUserRequest, authorization: Optional[str] = Header(None)):
+    if not authorization or authorization != f"Bearer {ADMIN_TOKEN}":
+        raise HTTPException(status_code=401, detail="Admin only")
+    users[req.token] = {"name": req.name}
+    return {"ok": True, "name": req.name, "token": req.token}
+
+@app.get("/admin/users")
+async def list_users(authorization: Optional[str] = Header(None)):
+    if not authorization or authorization != f"Bearer {ADMIN_TOKEN}":
+        raise HTTPException(status_code=401, detail="Admin only")
+    return {token: info for token, info in users.items()}
+
+
+INSTALLER_TEMPLATE = r"""
+$BACKEND_URL = "wss://{host}/ws/bridge"
+$AGENT_TOKEN = "{token}"
+$INSTALL_DIR = "$env:USERPROFILE\PersonalAgent"
+$pyCmd = "python"
+
+Write-Host "מתקין את הסוכן האישי שלך..." -ForegroundColor Cyan
+
+foreach ($cmd in @("python","py","python3")) {{
+    try {{ if (& $cmd --version 2>&1) -match "Python 3") {{ $pyCmd = $cmd; break }} }} catch {{}}
+}}
+
+New-Item -ItemType Directory -Force -Path $INSTALL_DIR | Out-Null
+& $pyCmd -m pip install websockets --quiet
+
+$bridge = @'
+import asyncio,glob,json,os,subprocess,sys,webbrowser
+import websockets
+BACKEND_URL=os.environ.get("BACKEND_URL","")
+AGENT_TOKEN=os.environ.get("AGENT_TOKEN","")
+async def run():
+    url=f"{{BACKEND_URL}}?token={{AGENT_TOKEN}}"
+    while True:
+        try:
+            async with websockets.connect(url,ping_interval=30) as ws:
+                print("Connected! Agent ready.")
+                while True:
+                    d=json.loads(await ws.recv())
+                    r=await handle(d["tool"],d["input"])
+                    await ws.send(json.dumps({{"id":d["id"],"result":r}}))
+        except Exception as e:
+            print(f"Reconnecting...({e})")
+            await asyncio.sleep(5)
+async def handle(tool,i):
+    try:
+        if tool=="execute_command":
+            r=subprocess.run(["powershell","-NoProfile","-Command",i["command"]],capture_output=True,text=True,timeout=60,cwd=i.get("working_dir"),encoding="utf-8",errors="replace")
+            return (r.stdout+"\n"+r.stderr).strip() or "(no output)"
+        if tool=="read_file":
+            return open(i["path"],encoding="utf-8",errors="replace").read()[:50000]
+        if tool=="write_file":
+            os.makedirs(os.path.dirname(os.path.abspath(i["path"])),exist_ok=True); open(i["path"],"w",encoding="utf-8").write(i["content"]); return "OK"
+        if tool=="list_directory":
+            return "\n".join(f"[{'DIR' if os.path.isdir(os.path.join(i['path'],x)) else 'FILE'}] {x}" for x in sorted(os.listdir(i["path"])))
+        if tool=="open_browser":
+            webbrowser.open(i["url"]); return "Opened"
+        if tool=="search_files":
+            files=[f for f in glob.glob(os.path.join(i["directory"],"**",i.get("pattern","*")),recursive=True) if os.path.isfile(f)]; return "\n".join(files[:200])
+        if tool=="read_md_files":
+            files=glob.glob(os.path.join(i["directory"],"**","*.md"),recursive=True)[:15]; return "\n\n".join(f"==={f}===\n"+open(f,encoding="utf-8",errors="replace").read()[:3000] for f in files)
+        return f"unknown tool: {{tool}}"
+    except Exception as e:
+        return f"Error: {{e}}"
+asyncio.run(run())
+'@
+$bridge | Out-File "$INSTALL_DIR\bridge.py" -Encoding UTF8
+"@echo off`nset BACKEND_URL=$BACKEND_URL`nset AGENT_TOKEN=$AGENT_TOKEN`n$pyCmd `"$INSTALL_DIR\bridge.py`"`npause" | Out-File "$INSTALL_DIR\start.bat" -Encoding ASCII
+
+$sh = New-Object -comObject WScript.Shell
+$sc = $sh.CreateShortcut("$env:USERPROFILE\Desktop\Personal AI Agent.lnk")
+$sc.TargetPath="$INSTALL_DIR\start.bat"; $sc.IconLocation="shell32.dll,13"; $sc.Save()
+
+$env:BACKEND_URL=$BACKEND_URL; $env:AGENT_TOKEN=$AGENT_TOKEN
+Start-Process $pyCmd -ArgumentList "`"$INSTALL_DIR\bridge.py`""
+Write-Host "הותקן! נוצר קיצור דרך בשולחן העבודה." -ForegroundColor Green
+Write-Host "עכשיו פתח את הקישור: https://{host}?token={token}" -ForegroundColor Cyan
+Read-Host "לחץ Enter לסגור"
+"""
+
+@app.get("/installer/{token}")
+async def get_installer(token: str, request_host: Optional[str] = Header(None, alias="host")):
+    if token not in users:
+        raise HTTPException(status_code=404, detail="Token not found")
+    host = request_host or "personal-agent-q29j.onrender.com"
+    script = INSTALLER_TEMPLATE.format(host=host, token=token)
+    return PlainTextResponse(content=script, media_type="text/plain; charset=utf-8")
 
 
 @app.get("/")
 async def root():
     return FileResponse("static/index.html")
-
 
 app.mount("/static", StaticFiles(directory="static"), name="static")

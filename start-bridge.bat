@@ -3,9 +3,9 @@ echo Starting Personal Agent Local Bridge...
 echo.
 
 REM Set your values here after deploying:
-set BACKEND_URL=wss://personal-agent.up.railway.app/ws/bridge
-set AGENT_TOKEN=change-me-secret
+set BACKEND_URL=wss://personal-agent-q29j.onrender.com/ws/bridge
+set AGENT_TOKEN=gil1988
 
 cd /d "%~dp0local_bridge"
-python bridge.py
+py bridge.py
 pause
