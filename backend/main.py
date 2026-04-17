@@ -338,7 +338,7 @@ def build_installer(host: str, token: str) -> str:
         '$BACKEND_URL = "wss://' + host + '/ws/bridge"',
         '$AGENT_TOKEN = "' + token + '"',
         '$INSTALL_DIR = "$env:USERPROFILE\\PersonalAgent"',
-        '$pyCmd = "python"',
+        '$pyCmd = $null',
         '',
         'Write-Host "מתקין את הסוכן האישי שלך..." -ForegroundColor Cyan',
         '',
