@@ -292,81 +292,90 @@ async def list_users(authorization: Optional[str] = Header(None)):
     return {token: info for token, info in users.items()}
 
 
-INSTALLER_TEMPLATE = r"""
-$BACKEND_URL = "wss://{host}/ws/bridge"
-$AGENT_TOKEN = "{token}"
-$INSTALL_DIR = "$env:USERPROFILE\PersonalAgent"
-$pyCmd = "python"
+def build_installer(host: str, token: str) -> str:
+    bridge_code = (
+        'import asyncio,glob,json,os,subprocess,sys,webbrowser\n'
+        'import websockets\n'
+        'BACKEND_URL=os.environ.get("BACKEND_URL","")\n'
+        'AGENT_TOKEN=os.environ.get("AGENT_TOKEN","")\n'
+        'async def run():\n'
+        '    url=BACKEND_URL+"?token="+AGENT_TOKEN\n'
+        '    while True:\n'
+        '        try:\n'
+        '            async with websockets.connect(url,ping_interval=30) as ws:\n'
+        '                print("Connected! Agent ready.")\n'
+        '                while True:\n'
+        '                    d=json.loads(await ws.recv())\n'
+        '                    r=await handle(d["tool"],d["input"])\n'
+        '                    await ws.send(json.dumps({"id":d["id"],"result":r}))\n'
+        '        except Exception as e:\n'
+        '            print("Reconnecting...",e)\n'
+        '            await asyncio.sleep(5)\n'
+        'async def handle(tool,i):\n'
+        '    try:\n'
+        '        if tool=="execute_command":\n'
+        '            r=subprocess.run(["powershell","-NoProfile","-Command",i["command"]],capture_output=True,text=True,timeout=60,cwd=i.get("working_dir"),encoding="utf-8",errors="replace")\n'
+        '            return (r.stdout+"\\n"+r.stderr).strip() or "(no output)"\n'
+        '        if tool=="read_file":\n'
+        '            return open(i["path"],encoding="utf-8",errors="replace").read()[:50000]\n'
+        '        if tool=="write_file":\n'
+        '            os.makedirs(os.path.dirname(os.path.abspath(i["path"])),exist_ok=True); open(i["path"],"w",encoding="utf-8").write(i["content"]); return "OK"\n'
+        '        if tool=="list_directory":\n'
+        '            items=sorted(os.listdir(i["path"])); return "\\n".join(("[DIR] " if os.path.isdir(os.path.join(i["path"],x)) else "[FILE] ")+x for x in items)\n'
+        '        if tool=="open_browser":\n'
+        '            webbrowser.open(i["url"]); return "Opened"\n'
+        '        if tool=="search_files":\n'
+        '            files=[f for f in glob.glob(os.path.join(i["directory"],"**",i.get("pattern","*")),recursive=True) if os.path.isfile(f)]; return "\\n".join(files[:200])\n'
+        '        if tool=="read_md_files":\n'
+        '            files=glob.glob(os.path.join(i["directory"],"**","*.md"),recursive=True)[:15]; return "\\n\\n".join("==="+f+"===\\n"+open(f,encoding="utf-8",errors="replace").read()[:3000] for f in files)\n'
+        '        return "unknown tool: "+tool\n'
+        '    except Exception as e:\n'
+        '        return "Error: "+str(e)\n'
+        'asyncio.run(run())\n'
+    )
 
-Write-Host "מתקין את הסוכן האישי שלך..." -ForegroundColor Cyan
-
-foreach ($cmd in @("python","py","python3")) {{
-    try {{ if (& $cmd --version 2>&1) -match "Python 3") {{ $pyCmd = $cmd; break }} }} catch {{}}
-}}
-
-New-Item -ItemType Directory -Force -Path $INSTALL_DIR | Out-Null
-& $pyCmd -m pip install websockets --quiet
-
-$bridge = @'
-import asyncio,glob,json,os,subprocess,sys,webbrowser
-import websockets
-BACKEND_URL=os.environ.get("BACKEND_URL","")
-AGENT_TOKEN=os.environ.get("AGENT_TOKEN","")
-async def run():
-    url=f"{{BACKEND_URL}}?token={{AGENT_TOKEN}}"
-    while True:
-        try:
-            async with websockets.connect(url,ping_interval=30) as ws:
-                print("Connected! Agent ready.")
-                while True:
-                    d=json.loads(await ws.recv())
-                    r=await handle(d["tool"],d["input"])
-                    await ws.send(json.dumps({{"id":d["id"],"result":r}}))
-        except Exception as e:
-            print(f"Reconnecting...({e})")
-            await asyncio.sleep(5)
-async def handle(tool,i):
-    try:
-        if tool=="execute_command":
-            r=subprocess.run(["powershell","-NoProfile","-Command",i["command"]],capture_output=True,text=True,timeout=60,cwd=i.get("working_dir"),encoding="utf-8",errors="replace")
-            return (r.stdout+"\n"+r.stderr).strip() or "(no output)"
-        if tool=="read_file":
-            return open(i["path"],encoding="utf-8",errors="replace").read()[:50000]
-        if tool=="write_file":
-            os.makedirs(os.path.dirname(os.path.abspath(i["path"])),exist_ok=True); open(i["path"],"w",encoding="utf-8").write(i["content"]); return "OK"
-        if tool=="list_directory":
-            return "\n".join(f"[{'DIR' if os.path.isdir(os.path.join(i['path'],x)) else 'FILE'}] {x}" for x in sorted(os.listdir(i["path"])))
-        if tool=="open_browser":
-            webbrowser.open(i["url"]); return "Opened"
-        if tool=="search_files":
-            files=[f for f in glob.glob(os.path.join(i["directory"],"**",i.get("pattern","*")),recursive=True) if os.path.isfile(f)]; return "\n".join(files[:200])
-        if tool=="read_md_files":
-            files=glob.glob(os.path.join(i["directory"],"**","*.md"),recursive=True)[:15]; return "\n\n".join(f"==={f}===\n"+open(f,encoding="utf-8",errors="replace").read()[:3000] for f in files)
-        return f"unknown tool: {{tool}}"
-    except Exception as e:
-        return f"Error: {{e}}"
-asyncio.run(run())
-'@
-$bridge | Out-File "$INSTALL_DIR\bridge.py" -Encoding UTF8
-"@echo off`nset BACKEND_URL=$BACKEND_URL`nset AGENT_TOKEN=$AGENT_TOKEN`n$pyCmd `"$INSTALL_DIR\bridge.py`"`npause" | Out-File "$INSTALL_DIR\start.bat" -Encoding ASCII
-
-$sh = New-Object -comObject WScript.Shell
-$sc = $sh.CreateShortcut("$env:USERPROFILE\Desktop\Personal AI Agent.lnk")
-$sc.TargetPath="$INSTALL_DIR\start.bat"; $sc.IconLocation="shell32.dll,13"; $sc.Save()
-
-$env:BACKEND_URL=$BACKEND_URL; $env:AGENT_TOKEN=$AGENT_TOKEN
-Start-Process $pyCmd -ArgumentList "`"$INSTALL_DIR\bridge.py`""
-Write-Host "הותקן! נוצר קיצור דרך בשולחן העבודה." -ForegroundColor Green
-Write-Host "עכשיו פתח את הקישור: https://{host}?token={token}" -ForegroundColor Cyan
-Read-Host "לחץ Enter לסגור"
-"""
+    lines = [
+        '$BACKEND_URL = "wss://' + host + '/ws/bridge"',
+        '$AGENT_TOKEN = "' + token + '"',
+        '$INSTALL_DIR = "$env:USERPROFILE\\PersonalAgent"',
+        '$pyCmd = "python"',
+        '',
+        'Write-Host "מתקין את הסוכן האישי שלך..." -ForegroundColor Cyan',
+        '',
+        'foreach ($cmd in @("python","py","python3")) {',
+        '    try { $v = & $cmd --version 2>&1; if ($v -match "Python 3") { $pyCmd = $cmd; break } } catch {}',
+        '}',
+        '',
+        'New-Item -ItemType Directory -Force -Path $INSTALL_DIR | Out-Null',
+        '& $pyCmd -m pip install websockets --quiet',
+        '',
+        '@\'' ,
+    ]
+    lines.append(bridge_code)
+    lines += [
+        '\'@ | Out-File "$INSTALL_DIR\\bridge.py" -Encoding UTF8',
+        '',
+        '"@echo off`r`nset BACKEND_URL=$BACKEND_URL`r`nset AGENT_TOKEN=$AGENT_TOKEN`r`n$pyCmd `"$INSTALL_DIR\\bridge.py`"`r`npause" | Out-File "$INSTALL_DIR\\start.bat" -Encoding ASCII',
+        '',
+        '$sh = New-Object -comObject WScript.Shell',
+        '$sc = $sh.CreateShortcut("$env:USERPROFILE\\Desktop\\Personal AI Agent.lnk")',
+        '$sc.TargetPath="$INSTALL_DIR\\start.bat"; $sc.IconLocation="shell32.dll,13"; $sc.Save()',
+        '',
+        '$env:BACKEND_URL=$BACKEND_URL; $env:AGENT_TOKEN=$AGENT_TOKEN',
+        'Start-Process $pyCmd -ArgumentList "`"$INSTALL_DIR\\bridge.py`""',
+        'Write-Host "הותקן! נוצר קיצור דרך בשולחן העבודה." -ForegroundColor Green',
+        'Write-Host "פתח עכשיו: https://' + host + '" -ForegroundColor Cyan',
+        'Write-Host "הסיסמא שלך: ' + token + '" -ForegroundColor Yellow',
+        'Read-Host "לחץ Enter לסגור"',
+    ]
+    return "\n".join(lines)
 
 @app.get("/installer/{token}")
 async def get_installer(token: str, request_host: Optional[str] = Header(None, alias="host")):
     if token not in users:
         raise HTTPException(status_code=404, detail="Token not found")
     host = request_host or "personal-agent-q29j.onrender.com"
-    script = INSTALLER_TEMPLATE.replace("{host}", host).replace("{token}", token)
+    script = build_installer(host, token)
     return PlainTextResponse(content=script, media_type="text/plain; charset=utf-8")
 
 
